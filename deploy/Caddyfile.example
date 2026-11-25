@@ -1,0 +1,48 @@
+# Caddyfile for voice-coding-mcp.
+# deploy/setup.sh installs this as /etc/caddy/Caddyfile and replaces
+# vcm.example.com with the host passed to it.
+#
+# Caddy obtains and renews the Let's Encrypt certificate automatically. It
+# needs ports 80 and 443 reachable from the internet and a DNS A record for
+# the host pointing at this server.
+
+{
+	# Optional: contact address for Let's Encrypt expiry notices.
+	# email you@example.com
+}
+
+vcm.example.com {
+	# No `log` directive on purpose: Caddy then writes no access log. The app
+	# logs every request itself, without query strings or secrets.
+
+	# Do not advertise the server software.
+	header -Server
+
+	# Optional hardening: Claude's connector traffic comes from
+	# 160.79.104.0/21. Everything except /authorize (which the owner opens in
+	# a browser to enter the pairing code) can be limited to that range.
+	# Uncomment to enable. Note that /healthz then also answers 403 from
+	# outside; check it on the server with curl http://127.0.0.1:8787/healthz.
+	#
+	# @notClaude {
+	# 	not path /authorize
+	# 	not remote_ip 160.79.104.0/21
+	# }
+	# respond @notClaude "Forbidden" 403
+
+	# Must match "listen" (host and port) in the server's config.json.
+	reverse_proxy 127.0.0.1:8787 {
+		# Pass responses through immediately (Streamable HTTP, SSE).
+		flush_interval -1
+
+		transport http {
+			dial_timeout 5s
+			# Tool calls wait up to about 25 s (syncWaitSeconds) and voice
+			# mode gives up after roughly 30 to 40 s. Allow comfortably more
+			# than that before Caddy treats the backend as hung.
+			response_header_timeout 90s
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
+}

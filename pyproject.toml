@@ -1,0 +1,95 @@
+[project]
+name = "voice-coding-mcp"
+version = "0.1.0"
+description = "Remote MCP server that lets voice mode in the Claude apps run headless Claude Code tasks on your Mac or a Linux VPS"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Honza Pavel" }]
+keywords = ["mcp", "model-context-protocol", "claude-code", "claude", "voice", "voice-mode", "oauth", "remote-mcp", "tailscale-funnel"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+    # Official MCP Python SDK: stateless Streamable HTTP with plain JSON responses (2025 handshake
+    # versions and 2026-07-28). Brings anyio, httpx2, sse-starlette, python-multipart transitively.
+    "mcp==2.3.0",
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+    # Maintained successor of httpx (pydantic/httpx2); already required by mcp. Used for CIMD and notify.
+    "httpx2==2.16.0",
+    "pydantic==2.14.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/HonzaPavel/voice-coding-mcp"
+Repository = "https://github.com/HonzaPavel/voice-coding-mcp"
+Issues = "https://github.com/HonzaPavel/voice-coding-mcp/issues"
+
+[project.scripts]
+voice-coding-mcp = "voice_coding_mcp.cli:run"
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "pytest-asyncio==1.4.1.post1",
+    "ruff==0.17.4",
+    "mypy==2.4.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.uv]
+# Supply chain: resolve only releases at least two weeks old at the time of locking. A relative
+# duration (not a fixed date), so Dependabot updates and `uv lock --upgrade` keep working; it
+# matches the Dependabot cooldown in .github/dependabot.yml. Dependabot therefore cannot propose
+# security fixes younger than 14 days either; for an urgent one add
+# `exclude-newer-package = { <package> = "1 day" }` here (a date or false also work) and run
+# `uv lock --upgrade-package <package>`. See .github/dependabot.yml.
+exclude-newer = "14 days"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "ASYNC", "RUF", "PT", "PL"]
+ignore = [
+    "E501",  # ruff format owns line length; long prompt and message strings stay on one line
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR2004",  # OAuth/MCP handlers are long linear checks with spec-defined numbers
+    "RUF001", "RUF002", "RUF003",  # "…" and accented text are intentional
+    "PLE1205", "PLE1206",  # our Logger is not stdlib logging (fields dict, no format args)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["voice_coding_mcp", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true

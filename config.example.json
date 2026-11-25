@@ -1,0 +1,31 @@
+{
+  "publicUrl": "https://vcm.example.com",
+  "listen": { "host": "127.0.0.1", "port": 8787, "allowNonLoopback": false },
+  "stateDir": "/var/lib/voice-coding-mcp",
+  "projectRoots": ["/home/vcm/projects"],
+  "claude": {
+    "bin": "claude",
+    "model": null,
+    "effort": null,
+    "maxTurns": null,
+    "permissionMode": "auto",
+    "settingSources": ["user"],
+    "configDir": null,
+    "mcpServers": {},
+    "extraArgs": [],
+    "env": {}
+  },
+  "tasks": { "syncWaitSeconds": 25, "timeoutMinutes": 15, "maxConcurrent": 2, "maxQueued": 10, "resumeWithinHours": 12, "keepDays": 14 },
+  "sessions": { "days": 7, "replyWaitMinutes": 10 },
+  "remoteControl": { "maxSessions": 3 },
+  "oauth": {
+    "accessTokenHours": 24,
+    "refreshTokenDays": 90,
+    "pairingMinutes": 10,
+    "redirectUris": ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback"],
+    "cimdClientIds": ["https://claude.ai/oauth/mcp-oauth-client-metadata"],
+    "allowLoopbackRedirects": false
+  },
+  "notify": { "url": null, "headers": {}, "includeResult": false },
+  "logPrompts": false
+}

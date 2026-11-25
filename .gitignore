@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+*.log
+logs/
+
+# Local config and state
+config.local.json
+*.local.json
+.state/
+state/
+.env
+.env.*
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Private notes for Claude Code
+CLAUDE.local.md
+/config.json
+.claude/settings.local.json
