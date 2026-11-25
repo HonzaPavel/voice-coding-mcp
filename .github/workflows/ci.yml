@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  # Pushes to main only; branches are covered by their pull request (no double runs).
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SHA-256 of the uv-<target>.tar.gz release asset for the version below (Linux ones as in
+          # deploy/setup.sh). macOS is the main deployment mode (deploy/mac/vcm-mac).
+          - os: macos-latest
+            uv-sha256: 81b811b57e4624df7ed3aac148e0359100d9962f3d9dce00aec533dc2e086731
+          - os: ubuntu-24.04
+            uv-sha256: c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83
+          - os: ubuntu-24.04-arm
+            uv-sha256: 71279f8d3c67241e807b9d8db872d1bf541579fb9f08b7d1eb1682196d1e57dc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # Same uv release as deploy/setup.sh.
+          version: "0.13.7"
+          checksum: ${{ matrix.uv-sha256 }}
+          enable-cache: true
+
+      # Python 3.12 from .python-version; exact versions from uv.lock (fails if it is out of date).
+      - run: uv sync --locked
+      - run: uv run pytest
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy --strict src tests
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q shellcheck
+          fi
+          shellcheck deploy/*.sh deploy/mac/vcm-mac

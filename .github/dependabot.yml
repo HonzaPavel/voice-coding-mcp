@@ -1,0 +1,24 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Python dependencies in pyproject.toml and uv.lock.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    # Matches [tool.uv] exclude-newer = "14 days" in pyproject.toml: only releases at least two
+    # weeks old. Keep both values in step.
+    #
+    # Dependabot runs `uv lock`, which honors exclude-newer, so it cannot propose a release younger
+    # than 14 days, security fixes included (dependabot-core#16984). For an urgent fix, exempt that
+    # one package in pyproject.toml and relock by hand:
+    #   [tool.uv]
+    #   exclude-newer-package = { <package> = "1 day" }   # or a date such as "2026-11-20", or false
+    # then `uv lock --upgrade-package <package>`, and remove the override once the release is older
+    # than 14 days (relock again).
+    cooldown:
+      default-days: 14

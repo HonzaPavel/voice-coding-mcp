@@ -1,0 +1,548 @@
+#!/bin/bash
+# vcm-mac: run voice-coding-mcp on a Mac on demand, published through Tailscale Funnel.
+#
+#   vcm-mac on       start the server and open the Funnel; it stays on until `vcm-mac off`
+#   vcm-mac off      close the Funnel and stop the server (idempotent)
+#   vcm-mac status   show whether it is on, the URL, the server pid and `voice-coding-mcp status`
+#
+# Environment:
+#   VCM_CONFIG     config file (default ~/.config/voice-coding-mcp/config.json)
+#   VCM_LOG_DIR    directory for the server log (default <config dir>/logs)
+#   VCM_RUN_DIR    directory for pid and state files (default <config dir>/run)
+#   VCM_TAILSCALE  path to the Tailscale CLI (default: the Mac app's binary, then `tailscale` on PATH)
+#
+# Written for the bash 3.2 that ships with macOS.
+
+set -euo pipefail
+# Logs, pid files and the rewritten config are private to the owner.
+umask 077
+
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/../.." && pwd)"
+UV=""
+
+CONFIG="${VCM_CONFIG:-$HOME/.config/voice-coding-mcp/config.json}"
+CONFIG_DIR="$(cd "$(dirname "$CONFIG")" 2>/dev/null && pwd || dirname "$CONFIG")"
+CONFIG="$CONFIG_DIR/$(basename "$CONFIG")"
+LOG_DIR="${VCM_LOG_DIR:-$CONFIG_DIR/logs}"
+RUN_DIR="${VCM_RUN_DIR:-$CONFIG_DIR/run}"
+LOG_FILE="$LOG_DIR/vcm-mac-server.log"
+SERVER_PID_FILE="$RUN_DIR/server.pid"
+FUNNEL_PORT_FILE="$RUN_DIR/funnel.port"
+LOCK_FILE="$RUN_DIR/vcm-mac.lock"
+# Set from listen.host in the config by load_listen.
+LISTEN_HOST="127.0.0.1"
+
+APP_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+TS=""
+
+die() {
+  printf 'vcm-mac: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+usage() {
+  sed -n '2,12p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+}
+
+# Runs the Python CLI from the repo's uv project (uv syncs the venv from uv.lock on first use).
+vcm_cmd() {
+  "$UV" run --frozen --quiet --project "$REPO_DIR" voice-coding-mcp "$@"
+}
+
+# --- Tailscale -------------------------------------------------------------
+
+find_tailscale() {
+  if [ -n "${VCM_TAILSCALE:-}" ]; then
+    [ -x "$VCM_TAILSCALE" ] || die "VCM_TAILSCALE=$VCM_TAILSCALE is not an executable file."
+    TS="$VCM_TAILSCALE"
+  elif [ -x "$APP_CLI" ]; then
+    # Preferred over PATH: the app's /usr/local/bin/tailscale is a sh wrapper that does not exec.
+    TS="$APP_CLI"
+  elif command -v tailscale >/dev/null 2>&1; then
+    TS="$(command -v tailscale)"
+  else
+    return 1
+  fi
+}
+
+require_tailscale() {
+  find_tailscale || die "Tailscale CLI not found (looked for $APP_CLI and \`tailscale\` on PATH).
+Install the Tailscale app from https://tailscale.com/download/mac, open it and sign in, then run this again."
+}
+
+# Prints the machine's MagicDNS name without the trailing dot, or fails if not logged in.
+tailscale_hostname() {
+  local json state magic name
+  json="$("$TS" status --json 2>/dev/null)" || die "\`tailscale status --json\` failed. Is the Tailscale app running? Open it and sign in."
+  state="$(printf '%s' "$json" | jq -r '.BackendState // empty')"
+  if [ "$state" != "Running" ]; then
+    die "Tailscale is not connected (state: ${state:-unknown}). Open the Tailscale app, sign in and connect, then run this again."
+  fi
+  magic="$(printf '%s' "$json" | jq -r 'if .CurrentTailnet == null then "unknown" else (.CurrentTailnet.MagicDNSEnabled | tostring) end')"
+  if [ "$magic" = false ]; then
+    die "MagicDNS is off for this tailnet, and Funnel needs the machine's ts.net name. Enable MagicDNS in the Tailscale admin console (DNS page), then run this again."
+  fi
+  name="$(printf '%s' "$json" | jq -r '.Self.DNSName // empty')"
+  name="${name%.}"
+  [ -n "$name" ] || die "Tailscale reports no DNS name for this Mac. Enable MagicDNS in the admin console (DNS page)."
+  printf '%s\n' "$name"
+}
+
+# --- config ----------------------------------------------------------------
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required (it ships with macOS 15 and later; otherwise \`brew install jq\`)."
+}
+
+require_tools() {
+  require_jq
+  UV="$(command -v uv 2>/dev/null || true)"
+  [ -n "$UV" ] || die "uv is required (https://docs.astral.sh/uv/, e.g. \`brew install uv\`)."
+  command -v curl >/dev/null 2>&1 || die "curl is required."
+}
+
+require_config() {
+  [ -f "$CONFIG" ] || die "Config not found: $CONFIG (set VCM_CONFIG or copy config.example.json there)."
+}
+
+config_port() {
+  jq -r '.listen.port // 8787' "$CONFIG"
+}
+
+config_host() {
+  jq -r '.listen.host // "127.0.0.1"' "$CONFIG"
+}
+
+# Reads listen.host into LISTEN_HOST (the address the server binds and the Funnel proxies to).
+load_listen() {
+  LISTEN_HOST="$(config_host)"
+  [ -n "$LISTEN_HOST" ] || LISTEN_HOST="127.0.0.1"
+}
+
+# LISTEN_HOST for use in a URL (IPv6 literals in brackets).
+url_host() {
+  case "$LISTEN_HOST" in
+    *:*) printf '[%s]\n' "$LISTEN_HOST" ;;
+    *) printf '%s\n' "$LISTEN_HOST" ;;
+  esac
+}
+
+# The target given to `tailscale funnel --bg`: the bare port means 127.0.0.1.
+funnel_target() {
+  if [ "$LISTEN_HOST" = 127.0.0.1 ]; then
+    printf '%s\n' "$1"
+  else
+    printf 'http://%s:%s\n' "$(url_host)" "$1"
+  fi
+}
+
+config_public_url() {
+  jq -r '.publicUrl // empty' "$CONFIG"
+}
+
+# Rewrites publicUrl in place, keeping mode 600. Prints "changed" or "unchanged".
+ensure_public_url() {
+  local want="$1" have tmp
+  have="$(config_public_url)"
+  have="${have%/}"
+  if [ "$have" = "$want" ]; then
+    echo unchanged
+    return
+  fi
+  tmp="$(mktemp "$CONFIG_DIR/.config.json.XXXXXX")"
+  chmod 600 "$tmp"
+  if ! jq --arg url "$want" '.publicUrl = $url' "$CONFIG" >"$tmp"; then
+    rm -f "$tmp"
+    die "Could not update publicUrl in $CONFIG."
+  fi
+  mv -f "$tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  echo changed
+}
+
+# --- processes -------------------------------------------------------------
+
+read_pid() {
+  local file="$1" pid
+  [ -f "$file" ] || return 1
+  pid="$(tr -cd '0-9' <"$file")"
+  [ -n "$pid" ] || return 1
+  printf '%s\n' "$pid"
+}
+
+alive() {
+  kill -0 "$1" 2>/dev/null
+}
+
+# Like alive, but a zombie (our own exited child not yet reaped by wait) does not count.
+running() {
+  local stat
+  stat="$(ps -o stat= -p "$1" 2>/dev/null | tr -d " " || true)"
+  case "$stat" in
+    "" | Z*) return 1 ;;
+  esac
+  return 0
+}
+
+# Succeeds if a server holds the flock on its pid file (`serve --pid-file` keeps it for its whole
+# lifetime; the kernel drops it when the server dies). lockf takes the lock only to run `true` and
+# exits 75 (EX_TEMPFAIL) at once when it is held; -k keeps and -n does not create the file.
+pid_file_locked() {
+  local rc=0
+  [ -f "$SERVER_PID_FILE" ] || return 1
+  /usr/bin/lockf -kns -t 0 "$SERVER_PID_FILE" true || rc=$?
+  [ "$rc" -eq 75 ]
+}
+
+# Prints the pid of our running server (the Python process, as it wrote it into the pid file).
+server_pid() {
+  pid_file_locked || return 1
+  read_pid "$SERVER_PID_FILE"
+}
+
+# Removes a pid file whose lock is free (left behind by a crash or kill -9). Only on and off call
+# it, under the on/off lock.
+drop_stale_pid_file() {
+  local pid
+  [ -f "$SERVER_PID_FILE" ] || return 0
+  pid_file_locked && return 0
+  pid="$(read_pid "$SERVER_PID_FILE" 2>/dev/null || true)"
+  rm -f "$SERVER_PID_FILE"
+  printf 'vcm-mac: removed the stale pid file %s (its lock is free, pid %s is not a running server).\n' \
+    "$SERVER_PID_FILE" "${pid:-none}" >&2
+}
+
+# Sends signal $1 to the pids that follow, ignoring those already gone.
+signal() {
+  local sig="$1"
+  shift
+  [ "$#" -gt 0 ] || return 0
+  kill "-$sig" "$@" 2>/dev/null || true
+}
+
+# Waits up to $2 seconds (polling every 0.5 s) until check $1 (alive or running) fails for every
+# pid that follows. Fails if some pid is still there at the end.
+wait_gone() {
+  local check="$1" tries=$(($2 * 2)) i=0 p any
+  shift 2
+  while [ "$i" -lt "$tries" ]; do
+    any=0
+    for p in "$@"; do "$check" "$p" && any=1; done
+    [ "$any" -eq 0 ] && return 0
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Stops the server with pid $1: one TERM (a second signal would make it skip its graceful
+# shutdown), so uv and caffeinate exit after it. Waits up to $2 seconds, then KILL to that pid only.
+stop_pid() {
+  local pid="$1" wait_s="${2:-25}"
+  signal TERM "$pid"
+  wait_gone alive "$wait_s" "$pid" && return 0
+  signal KILL "$pid"
+  wait_gone alive 5 "$pid" || true
+}
+
+# Prints all descendants of $1 (children first found, depth-first), without $1 itself.
+descendants() {
+  local kid
+  for kid in $(pgrep -P "$1" 2>/dev/null || true); do
+    printf '%s\n' "$kid"
+    descendants "$kid"
+  done
+}
+
+# Stops $1 and everything below it: TERM, up to 2 s, then KILL. The tree is collected before the
+# first signal, so a wrapper that dies first cannot orphan its child (e.g. the app's sh wrapper
+# around the real Tailscale CLI, which would otherwise keep waiting for approval and later
+# configure a Funnel by itself).
+kill_tree() {
+  local procs
+  procs="$1 $(descendants "$1")"
+  # shellcheck disable=SC2086 # word splitting of the pid list is intended
+  signal TERM $procs
+  # shellcheck disable=SC2086
+  wait_gone running 2 $procs && return 0
+  # shellcheck disable=SC2086
+  signal KILL $procs
+}
+
+healthy() {
+  curl -fsS --max-time 2 "http://$(url_host):$1/healthz" >/dev/null 2>&1
+}
+
+# Creates the log and run directories (mode 700, also when they already exist).
+make_dirs() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  chmod 700 "$LOG_DIR" "$RUN_DIR"
+  if [ -f "$LOG_FILE" ]; then chmod 600 "$LOG_FILE"; fi
+}
+
+# --- lock ------------------------------------------------------------------
+
+# Serializes `on` and `off`: runs the script again under lockf(1), which holds a flock on
+# $LOCK_FILE while it runs. The kernel releases the lock when lockf exits, also after a crash or
+# kill -9, so a lock is never stale. lockf does not pass the lock's descriptor on, so the server
+# started by `on` does not hold it. VCM_LOCKED marks the inner run and is removed from its
+# environment, so a vcm-mac started by a server task takes the lock itself.
+run_locked() {
+  local rc=0
+  if [ "${VCM_LOCKED:-}" = 1 ]; then
+    unset VCM_LOCKED
+    return 0
+  fi
+  mkdir -p "$RUN_DIR"
+  chmod 700 "$RUN_DIR"
+  VCM_LOCKED=1 /usr/bin/lockf -ks -t 0 "$LOCK_FILE" "$SCRIPT_PATH" "$@" || rc=$?
+  [ "$rc" -ne 75 ] || die "Another vcm-mac on/off is running. Wait for it to finish."
+  exit "$rc"
+}
+
+start_server() {
+  local port="$1" launch pid i
+  make_dirs
+  if healthy "$port"; then
+    die "Something already answers on $(url_host):$port and it is not a server started by vcm-mac. Stop it first."
+  fi
+  {
+    printf '\n--- vcm-mac on, %s ---\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } >>"$LOG_FILE"
+  nohup caffeinate -is "$UV" run --frozen --quiet --project "$REPO_DIR" voice-coding-mcp serve --config "$CONFIG" \
+    --pid-file "$SERVER_PID_FILE" </dev/null >>"$LOG_FILE" 2>&1 &
+  launch=$!
+  i=0
+  while [ "$i" -lt 60 ]; do
+    if ! running "$launch"; then
+      drop_stale_pid_file 2>/dev/null
+      die "The server exited during start. Last log lines from $LOG_FILE:
+$(tail -n 15 "$LOG_FILE")"
+    fi
+    if healthy "$port" && server_pid >/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if pid="$(server_pid)"; then stop_pid "$pid" 5; else kill_tree "$launch"; fi
+  drop_stale_pid_file 2>/dev/null
+  die "The server did not answer /healthz on port $port within 30 s. See $LOG_FILE."
+}
+
+stop_server() {
+  local pid
+  if pid="$(server_pid)"; then
+    info "Stopping the server (pid $pid)."
+    stop_pid "$pid" 25
+  fi
+  drop_stale_pid_file
+}
+
+# --- funnel ----------------------------------------------------------------
+
+LINK_RE='https://login\.tailscale\.com/[^ ]*'
+
+# Succeeds if `tailscale funnel status` lists a proxy to our local port. With "funnel" as $2 the
+# proxy must also sit under a "(Funnel on)" address, not a "(tailnet only)" one.
+proxy_listed() {
+  local port="$1" need="${2:-any}" status
+  [ -n "$TS" ] || return 1
+  status="$("$TS" funnel status 2>/dev/null)" || return 1
+  printf '%s\n' "$status" | awk -v want="proxy http://$(url_host):$port" -v need="$need" '
+    /^https?:\/\// { on = ($0 ~ /\(Funnel on\)/) }
+    {
+      i = index($0, want)
+      if (i > 0) {
+        rest = substr($0, i + length(want))
+        if ((rest == "" || rest ~ /^[\/ ]/) && (need != "funnel" || on)) found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+funnel_active() {
+  proxy_listed "$1" funnel
+}
+
+# Prints the output of a failed `tailscale funnel --bg` with a hint, to stderr.
+funnel_failure() {
+  local port="$1" rc="$2" out="$3" err="$4" link
+  link="$(grep -Eo "$LINK_RE" "$out" | head -n 1 || true)"
+  {
+    cat "$out" "$err"
+    if [ -n "$link" ]; then
+      printf '\nFunnel (or HTTPS certificates) is not enabled for this tailnet yet.\nOpen this link, approve it, then run vcm-mac on again:\n  %s\n' "$link"
+    elif grep -q 'HTTPS must be enabled' "$err" "$out"; then
+      printf '\nFunnel needs HTTPS certificates. In the Tailscale admin console, DNS page, enable HTTPS Certificates, then run vcm-mac on again.\n'
+    elif grep -q '"funnel" node attribute not set' "$err" "$out"; then
+      printf '\nThis Mac lacks the "funnel" node attribute. Add it to the tailnet policy file (Access controls) under "nodeAttrs", e.g. {"target": ["autogroup:member"], "attr": ["funnel"]}, then run vcm-mac on again.\n'
+    elif [ "$rc" = timeout ]; then
+      printf '\n`tailscale funnel --bg %s` did not finish within 20 s.\n' "$port"
+    elif [ "$rc" -eq 0 ]; then
+      printf '\n`tailscale funnel --bg %s` exited without error, but `tailscale funnel status` does not show a Funnel to %s:%s.\n' "$port" "$(url_host)" "$port"
+    else
+      printf '\n`tailscale funnel --bg %s` failed (exit code %s).\n' "$port" "$rc"
+    fi
+  } >&2
+}
+
+# Runs `tailscale funnel --bg <port>` and checks `tailscale funnel status` afterwards (exit code 0
+# alone is not success). If the tailnet still needs Funnel or HTTPS enabled, the CLI prints an
+# approval link and may wait for approval; we print the link and stop waiting instead.
+open_funnel() {
+  local port="$1" out err pid i rc=0
+  out="$(mktemp "$RUN_DIR/funnel-out.XXXXXX")"
+  err="$(mktemp "$RUN_DIR/funnel-err.XXXXXX")"
+  "$TS" funnel --bg "$(funnel_target "$port")" </dev/null >"$out" 2>"$err" &
+  pid=$!
+  i=0
+  while alive "$pid" && [ "$i" -lt 40 ]; do
+    grep -Eq "$LINK_RE" "$out" && break
+    sleep 0.5
+    i=$((i + 1))
+  done
+  if alive "$pid"; then
+    # Still running: give the rest of the output a moment, then stop waiting.
+    sleep 1
+    kill_tree "$pid"
+    wait "$pid" 2>/dev/null || true
+    rc=timeout
+  else
+    wait "$pid" || rc=$?
+  fi
+  if [ "$rc" != timeout ] && ! grep -Eq "$LINK_RE" "$out" && funnel_active "$port"; then
+    rm -f "$out" "$err"
+    echo "$port" >"$FUNNEL_PORT_FILE"
+    return 0
+  fi
+  funnel_failure "$port" "$rc" "$out" "$err"
+  rm -f "$out" "$err"
+  return 1
+}
+
+# Turns off the Funnel only if it proxies our local port. `--https=443 off` removes all handlers on
+# public port 443 (our `funnel --bg` uses 443) and leaves other ports alone; it never resets the
+# whole serve config.
+close_funnel() {
+  local port out
+  find_tailscale || return 0
+  port="$(read_pid "$FUNNEL_PORT_FILE" 2>/dev/null || true)"
+  [ -n "$port" ] || port="$(config_port 2>/dev/null || true)"
+  if [ -z "$port" ] || [ "$port" = null ]; then
+    # No record of the port the Funnel was opened for, and the config cannot be read (missing
+    # file or no jq). Only a Funnel to the default port is closed here.
+    port=8787
+    printf 'vcm-mac: Warning: cannot tell which port the Funnel was opened for (no %s, and the config cannot be read, for example without jq); assuming the default 8787.\nA Funnel to another port is not closed: check `%s funnel status` and close it by hand.\n' "$FUNNEL_PORT_FILE" "$TS" >&2
+  fi
+  rm -f "$FUNNEL_PORT_FILE"
+  proxy_listed "$port" || return 0
+  out="$("$TS" funnel --https=443 off </dev/null 2>&1 || true)"
+  if proxy_listed "$port"; then
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    printf 'vcm-mac: Warning: the Funnel to %s:%s is still listed. Close it by hand:\n  %s funnel --https=443 off\nthen check `%s funnel status`.\n' "$(url_host)" "$port" "$TS" "$TS" >&2
+  else
+    info "Funnel closed."
+  fi
+}
+
+# --- commands --------------------------------------------------------------
+
+cmd_on() {
+  local host url port result
+  require_tools
+  require_config
+  require_tailscale
+  host="$(tailscale_hostname)"
+  url="https://$host"
+  port="$(config_port)"
+  load_listen
+  make_dirs
+  drop_stale_pid_file
+
+  result="$(ensure_public_url "$url")"
+  [ "$result" = changed ] && info "Set publicUrl in $CONFIG to $url."
+
+  if server_pid >/dev/null; then
+    if [ "$result" = changed ]; then
+      info "Restarting the server for the new publicUrl."
+      stop_server
+      start_server "$port"
+    else
+      info "Server already running (pid $(server_pid))."
+    fi
+  else
+    start_server "$port"
+    info "Server started (pid $(server_pid)), log $LOG_FILE."
+  fi
+
+  if ! open_funnel "$port"; then
+    stop_server
+    exit 1
+  fi
+
+  info ""
+  info "On. Connector URL: $url/mcp"
+  info "It stays on until you run: $SCRIPT_PATH off"
+  info "To pair a new client: uv run --project $REPO_DIR voice-coding-mcp pair --config $CONFIG"
+}
+
+cmd_off() {
+  if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then load_listen; fi
+  close_funnel
+  stop_server
+  info "Off."
+}
+
+cmd_status() {
+  local pid port url state="off"
+  require_jq
+  require_config
+  port="$(config_port)"
+  load_listen
+  url="$(config_public_url)"
+  find_tailscale || true
+  if pid="$(server_pid)"; then
+    if funnel_active "$port"; then state="on"; else state="server running, Funnel closed"; fi
+  else
+    pid=""
+    funnel_active "$port" && state="Funnel open, server not running"
+  fi
+  info "State: $state"
+  info "Connector URL: ${url%/}/mcp"
+  info "Server pid: ${pid:-none} (port $port)"
+  [ -n "$TS" ] || info "Tailscale CLI: not found"
+  info ""
+  if [ -n "$UV" ] || UV="$(command -v uv 2>/dev/null)"; then
+    vcm_cmd status --config "$CONFIG" || true
+  else
+    info "uv not found, cannot show the server status."
+  fi
+}
+
+case "${1:-}" in
+  on)
+    [ "$#" -eq 1 ] || die "usage: vcm-mac on (it takes no arguments)"
+    run_locked "$@"
+    cmd_on
+    ;;
+  off)
+    run_locked "$@"
+    cmd_off
+    ;;
+  status)
+    cmd_status
+    ;;
+  -h | --help | help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

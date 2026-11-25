@@ -1,0 +1,85 @@
+# systemd unit for voice-coding-mcp.
+# Installed by deploy/setup.sh to /etc/systemd/system/voice-coding-mcp.service.
+
+[Unit]
+Description=voice-coding-mcp (remote MCP server that runs Claude Code tasks)
+Documentation=file:///opt/voice-coding-mcp/docs/DEPLOY.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=vcm
+Group=vcm
+# Claude Code (native installer) lives in ~/.local/bin, so it must be on PATH
+# for `claude.bin: "claude"` to resolve.
+Environment=PATH=/home/vcm/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+# The app dir is read-only for vcm; bytecode is compiled by setup.sh.
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Holds CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`). The leading "-"
+# lets the unit load even if the file is missing; the app then reports the
+# missing token instead of systemd refusing to start.
+EnvironmentFile=-/etc/voice-coding-mcp/env
+# Never let an API key from anywhere override the subscription token.
+UnsetEnvironment=ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+WorkingDirectory=/home/vcm
+# The venv built by setup.sh (uv sync --frozen, root-owned).
+ExecStart=/opt/voice-coding-mcp/.venv/bin/voice-coding-mcp serve --config /etc/voice-coding-mcp/config.json
+Restart=on-failure
+RestartSec=5s
+# Kill every process in the cgroup on stop, so running `claude -p` children
+# (and whatever they spawned) die with the service.
+KillMode=control-group
+# The runner sends SIGTERM and escalates to SIGKILL after 10 s; give it room.
+TimeoutStopSec=30s
+
+# /var/lib/voice-coding-mcp, created and owned by vcm, private.
+StateDirectory=voice-coding-mcp
+StateDirectoryMode=0700
+# New files (state, logs, project files written by Claude Code) are private.
+UMask=0077
+
+# Hardening. Claude Code must still be able to do normal dev work as vcm:
+# write projects, ~/.claude, ~/.npm, ~/.cache, run git, npm, build tools,
+# and (optionally) its bubblewrap sandbox, which needs user namespaces.
+# Therefore there is deliberately no RestrictNamespaces=, no
+# CapabilityBoundingSet= (an empty bounding set also caps capabilities inside
+# a new user namespace and breaks bubblewrap), no SystemCallFilter= (bwrap
+# needs mount/unshare/pivot_root) and no MemoryDenyWriteExecute= (breaks the
+# JavaScript JIT inside Claude Code and the Node tooling projects use).
+#
+# The whole file system is read-only except the paths below, /dev, /proc, /sys.
+ProtectSystem=strict
+# Hide all homes (and /root, /run/user) behind an empty tmpfs ...
+ProtectHome=tmpfs
+# ... and bring back only vcm's home, writable.
+BindPaths=/home/vcm
+# Private /tmp and /var/tmp, cleaned when the service stops.
+PrivateTmp=yes
+# Only pseudo devices such as /dev/null, /dev/urandom, /dev/pts.
+PrivateDevices=yes
+# Other users' processes are invisible in /proc.
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# vcm has no sudo; also make sure setuid binaries cannot raise privileges.
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# IP for the API and git, Unix sockets for local tools, netlink for interface
+# lookups (some tools query it). No raw or packet sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Some headroom for the server plus parallel Claude Code runs and their tooling.
+LimitNOFILE=65536
+TasksMax=2048
+
+[Install]
+WantedBy=multi-user.target
