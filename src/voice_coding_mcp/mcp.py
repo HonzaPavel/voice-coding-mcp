@@ -102,7 +102,7 @@ def server_instructions(sync_wait_seconds: int) -> str:
             "Run read-only questions without asking for permission. Before a task that would change, delete or send something, ask only if the user's request is unclear.",
             "Pass the user's request to run_task in their own words and in their own language. Do not add instructions, plans or details of your own, and do not translate. Claude Code already knows that the answer will be read aloud.",
             f'Short tasks return the answer directly. A longer task returns a task id instead (for example "task 7"). Then say one short sentence and immediately call get_task_result again (it waits up to {sync_wait_seconds} seconds per call). Do not ask whether to wait. Repeat while the user has not changed the topic. Only after about a minute in total, tell the user the task is still running and offer to check later. Do not invent results while a task is running.',
-            'Read the tool results to the user as they are, without adding Markdown. In spoken answers write numbers, times and dates as words in the language of the conversation (in Czech, 19:45 is "tři čtvrtě na osm").',
+            "Read the tool results to the user as they are, without adding Markdown.",
         ]
     )
 

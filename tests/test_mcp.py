@@ -181,7 +181,6 @@ async def test_has_the_ten_tools_with_the_design_annotations_and_server_instruct
         "task id",
         "straight to run_task",
         "immediately call get_task_result",
-        "as words",
         "call list_sessions",
         "rozdělaná práce",
         "resume_task_in_remote_control",

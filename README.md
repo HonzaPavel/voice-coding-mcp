@@ -71,6 +71,12 @@ sudo voice-coding-mcp pair
 
 The full runbook, including deploy keys and the Claude side of pairing, is [Part B of DEPLOY.md](docs/DEPLOY.md#part-b-linux-vps-alternative).
 
+### Languages voice mode does not officially support
+
+Claude voice mode speaks some unsupported languages well (Czech, for example), but its text-to-speech reads digits in English there. This affects every voice conversation, not only this connector, so the server does not handle it. Add a personal instruction in the Claude app (Settings, Your Claude, Instructions), for example:
+
+> When you speak Czech in voice mode, write all numbers, times and dates as Czech words, also inside identifiers (HP-39 as "HP třicet devět"). Do not use numbered lists; say "zaprvé, zadruhé" instead.
+
 ## Turning it off and revoking access
 
 - Mac: `deploy/mac/vcm-mac off` closes the Funnel and stops the server. Tokens stay valid, so `vcm-mac on` works again without pairing.
