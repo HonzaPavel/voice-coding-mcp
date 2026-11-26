@@ -2,6 +2,8 @@
 
 A small remote MCP server that lets you drive Claude Code hands-free from the voice mode of the Claude apps. You add it to Claude as a [custom connector](https://support.claude.com/en/articles/11175166-getting-started-with-custom-connectors-using-remote-mcp) (a remote MCP server you add yourself); when you ask for something in one of your projects, the server runs headless Claude Code (`claude -p`) inside that project and returns a short answer meant to be read aloud. Longer tasks run in the background and you ask for the result later.
 
+Real examples, a diagram and the risks on one page: [voice-coding-mcp on honzapavel.cz](https://www.honzapavel.cz/en/voice-coding-mcp.html).
+
 Not affiliated with Anthropic. "Claude" and "Claude Code" are used only to describe what this project works with.
 
 It runs in one of two modes:
