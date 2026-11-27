@@ -1306,6 +1306,11 @@ class TaskManager:
         """Position in the queue (1-based), or None when not queued."""
         return self._queue.index(task_id) + 1 if task_id in self._queue else None
 
+    def has_work(self) -> bool:
+        """A headless task is queued or active (running, or a relay waiting for its reply). Session
+        tasks (run_task with remote_control) are never queued or active here."""
+        return bool(self._queue or self._active)
+
     async def cancel(self, task_id: int) -> CancelResult:
         """Cancels a queued task at once; aborts a running one and waits up to 5 s for it to stop."""
         task = self._tasks.get(task_id)

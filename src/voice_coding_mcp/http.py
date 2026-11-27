@@ -19,6 +19,7 @@ uvicorn runs with `proxy_headers=False`, `access_log=False`, `log_config=None`,
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from .auth.store import OAuthStore
 from .clock import Clock
 from .config import Config, config_warnings
 from .idle_close import IdleCloser
+from .idle_shutdown import Activity
 from .log import Logger, fingerprint, strip_query
 from .mcp import McpServerOptions, build_remote_control, create_mcp_server
 from .tasks.manager import TaskManager
@@ -70,6 +72,8 @@ class CreateAppOptions:
     store: OAuthStore
     manager: TaskManager
     auth: AuthRouterOverrides = AuthRouterOverrides()
+    activity: Activity | None = None
+    """Records authenticated tools/call requests for the idle shutdown."""
 
 
 def _json_rpc_error(status: int, code: int, message: str, headers: dict[str, str] | None = None) -> Response:
@@ -97,12 +101,24 @@ def _original_url(scope: Scope) -> str:
     return f"{path}?{query.decode('latin-1')}" if query else path
 
 
+def _is_tool_call(body: bytes) -> bool:
+    """The JSON-RPC body is a `tools/call` request (or a batch with one)."""
+    try:
+        message = json.loads(body)
+    except ValueError:
+        return False
+    messages = message if isinstance(message, list) else [message]
+    return any(isinstance(m, dict) and m.get("method") == "tools/call" for m in messages)
+
+
 class _McpEndpoint:
     """JSON body check (1 MB limit) in front of the SDK handler: the body is read and checked here
-    (413, 400 or 415 as JSON-RPC errors), then replayed to the SDK."""
+    (413, 400 or 415 as JSON-RPC errors), then replayed to the SDK. It sits behind the bearer check,
+    so a `tools/call` here is authenticated and counts as activity for the idle shutdown."""
 
-    def __init__(self, manager: StreamableHTTPSessionManager) -> None:
+    def __init__(self, manager: StreamableHTTPSessionManager, activity: Activity | None = None) -> None:
         self._manager = manager
+        self._activity = activity
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
@@ -128,6 +144,10 @@ class _McpEndpoint:
                 return {"type": "http.request", "body": body, "more_body": False}
             return await receive()
 
+        if self._activity is not None and _is_tool_call(body):
+            with self._activity.call():
+                await self._manager.handle_request({**scope, "headers": headers}, replay, send)
+            return
         await self._manager.handle_request({**scope, "headers": headers}, replay, send)
 
     @staticmethod
@@ -327,7 +347,7 @@ def create_app(options: CreateAppOptions) -> Starlette:
                 _App,
                 options=options,
                 auth_routes=auth_routes,
-                mcp_endpoint=_McpEndpoint(session_manager),
+                mcp_endpoint=_McpEndpoint(session_manager, options.activity),
             )
         ],
     )

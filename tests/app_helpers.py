@@ -24,6 +24,7 @@ from voice_coding_mcp.auth import OAuthStore
 from voice_coding_mcp.cli import _bind, _Server
 from voice_coding_mcp.config import Config, parse_config
 from voice_coding_mcp.http import AuthRouterOverrides, CreateAppOptions, create_app
+from voice_coding_mcp.idle_shutdown import Activity
 from voice_coding_mcp.tasks.manager import TaskManager, TaskManagerOptions
 
 
@@ -52,6 +53,7 @@ async def start_app(
     oauth: dict[str, Any] | None = None,
     http_client: httpx2.AsyncClient | None = None,
     projects: list[str] | None = None,
+    activity: Activity | None = None,
 ) -> AsyncIterator[AppCtx]:
     state_dir = str(root / "state")
     projects_dir = root / "projects"
@@ -100,6 +102,7 @@ async def start_app(
             store=store,
             manager=manager,
             auth=AuthRouterOverrides(rate_limit=None, http_client=http_client),
+            activity=activity,
         )
     )
     server = _Server(

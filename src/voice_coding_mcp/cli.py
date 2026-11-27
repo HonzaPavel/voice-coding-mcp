@@ -2,7 +2,8 @@
 
 `serve` runs uvicorn programmatically (`uvicorn.Server(...).serve()` in a task, own SIGTERM/SIGINT
 handling: first signal stops gracefully within 20 s, a second one exits at once with code 1). With
-`--pid-file` it holds a locked pid file for its lifetime (see `pid_file`).
+`--pid-file` it holds a locked pid file for its lifetime (see `pid_file`). The idle shutdown
+(`idleShutdownMinutes` or `--idle-shutdown-minutes`) stops it the same way, with exit code 0.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import fcntl
 import logging
 import os
@@ -29,6 +31,7 @@ from .auth.text import strip_control_chars
 from .clock import SECOND_MS, ago, now_ms
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError, load_config
 from .http import CreateAppOptions, create_app
+from .idle_shutdown import Activity, IdleShutdown
 from .json_file import ensure_dir
 from .log import Logger, as_log_level, create_logger
 from .mcp import SERVER_VERSION
@@ -111,6 +114,17 @@ def _minutes(text: str) -> int:
     return minutes
 
 
+def _non_negative(text: str) -> int:
+    """argparse type of `serve --idle-shutdown-minutes`: a whole number of at least 0."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be a whole number of at least 0, got {text}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="voice-coding-mcp", description=_DESCRIPTION, epilog=_EPILOG)
     parser.add_argument("-v", "--version", action="version", version=SERVER_VERSION)
@@ -130,6 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="write the server pid to PATH and hold an exclusive lock on it while running; "
         "refuse to start when another process holds the lock",
+    )
+    serve.add_argument(
+        "--idle-shutdown-minutes",
+        type=_non_negative,
+        metavar="N",
+        help="stop after N minutes without a tool call or running work; 0 turns it off (default: idleShutdownMinutes)",
     )
     pair = command("pair", "open a pairing window and print a one-time code")
     pair.add_argument(
@@ -152,6 +172,7 @@ class ParsedArgs:
     minutes: int | None = None
     yes: bool = False
     pid_file: str | None = None
+    idle_shutdown_minutes: int | None = None
 
 
 def parse_args(argv: Sequence[str]) -> ParsedArgs:
@@ -163,6 +184,7 @@ def parse_args(argv: Sequence[str]) -> ParsedArgs:
         minutes=getattr(ns, "minutes", None),
         yes=getattr(ns, "yes", False),
         pid_file=getattr(ns, "pid_file", None),
+        idle_shutdown_minutes=getattr(ns, "idle_shutdown_minutes", None),
     )
 
 
@@ -333,6 +355,7 @@ class RunningServer:
         manager: TaskManager,
         notifier: HttpNotifier | None,
         logger: Logger,
+        idle_shutdown: IdleShutdown | None = None,
     ) -> None:
         self.url = url
         self._server = server
@@ -340,16 +363,32 @@ class RunningServer:
         self._manager = manager
         self._notifier = notifier
         self._logger = logger
+        self._idle_shutdown = idle_shutdown
         self._stopping: asyncio.Task[None] | None = None
+        self._stop_requested = asyncio.Event()
+
+    def stop_soon(self, reason: str) -> None:
+        """Starts `stop` without waiting for it (signal handlers, the idle shutdown)."""
+        if self._stopping is None:
+            self._stopping = asyncio.ensure_future(self._stop(reason))
+            self._stop_requested.set()
+
+    async def wait_stopped(self) -> None:
+        """Returns once a stop (from any cause) has finished; raises when it failed."""
+        await self._stop_requested.wait()
+        assert self._stopping is not None
+        await asyncio.shield(self._stopping)
 
     async def stop(self, reason: str = "server stopped") -> None:
         """Stops accepting, shuts the task manager down and closes connections (at most 20 s). Idempotent."""
-        if self._stopping is None:
-            self._stopping = asyncio.ensure_future(self._stop(reason))
+        self.stop_soon(reason)
+        assert self._stopping is not None
         await asyncio.shield(self._stopping)
 
     async def _stop(self, reason: str) -> None:
         self._logger.info("server stopping", {"reason": reason})
+        if self._idle_shutdown is not None:
+            await self._idle_shutdown.stop()
         # uvicorn stops accepting, closes idle connections and lets running requests finish; the
         # manager fails queued tasks and stops running ones, which ends waiting tool calls.
         self._server.should_exit = True
@@ -416,7 +455,8 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     except BaseException:
         await _shutdown(manager, notifier, "server failed to start")
         raise
-    app = create_app(CreateAppOptions(config=config, logger=logger, store=store, manager=manager))
+    activity = Activity()
+    app = create_app(CreateAppOptions(config=config, logger=logger, store=store, manager=manager, activity=activity))
     server = _Server(
         uvicorn.Config(
             app,
@@ -442,7 +482,30 @@ async def start_server(config: Config, logger: Logger, env: Mapping[str, str] | 
     host = f"[{address[0]}]" if sock.family == socket.AF_INET6 else address[0]
     url = f"http://{host}:{address[1]}"
     logger.info("server started", {"version": SERVER_VERSION, "listen": url, "publicUrl": config.public_url})
-    return RunningServer(url=url, server=server, task=task, manager=manager, notifier=notifier, logger=logger)
+    running: RunningServer | None = None
+
+    def on_idle() -> None:
+        if running is not None:
+            running.stop_soon("idle shutdown")
+
+    idle_shutdown = IdleShutdown(
+        activity,
+        busy=manager.has_work,
+        idle_minutes=config.idle_shutdown_minutes,
+        on_idle=on_idle,
+        logger=logger.child({"component": "idle-shutdown"}),
+    )
+    running = RunningServer(
+        url=url,
+        server=server,
+        task=task,
+        manager=manager,
+        notifier=notifier,
+        logger=logger,
+        idle_shutdown=idle_shutdown,
+    )
+    idle_shutdown.start()
+    return running
 
 
 PID_FILE_RETRY_SECONDS = 1.0
@@ -507,6 +570,8 @@ async def _cmd_serve(config: Config, args: ParsedArgs, io: CliIo) -> int:
             except PidFileLockedError as err:
                 io.err(f"Error: {err}\n")
                 return EXIT_ERROR
+        if args.idle_shutdown_minutes is not None:
+            config = dataclasses.replace(config, idle_shutdown_minutes=args.idle_shutdown_minutes)
         return await _serve(config, io)
 
 
@@ -518,7 +583,6 @@ async def _serve(config: Config, io: CliIo) -> int:
         logger.error("server failed to start", {"error": err})
         return EXIT_ERROR
     loop = asyncio.get_running_loop()
-    done: asyncio.Future[int] = loop.create_future()
     signals = 0
 
     def on_signal(sig: signal.Signals) -> None:
@@ -529,17 +593,13 @@ async def _serve(config: Config, io: CliIo) -> int:
             sys.stdout.flush()
             os._exit(EXIT_ERROR)
 
-        async def stop() -> None:
-            await running.stop(f"server stopped ({sig.name})")
-            if not done.done():
-                done.set_result(EXIT_OK)
-
-        loop.create_task(stop())  # noqa: RUF006 (awaited through `done`)
+        running.stop_soon(f"server stopped ({sig.name})")
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, on_signal, sig)
     try:
-        return await done
+        await running.wait_stopped()
+        return EXIT_OK
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)

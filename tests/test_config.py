@@ -89,6 +89,7 @@ class TestDefaultsAndDerived:
             "idleCloseMinutes": 0,
         }
         assert config.log_prompts is False
+        assert config.idle_shutdown_minutes == 0
 
     def test_fills_defaults_inside_partial_sections(self, env: Env) -> None:
         config = env.parse(env.minimal(listen={"port": 9000}, tasks={"maxConcurrent": 1}))
@@ -144,6 +145,13 @@ class TestDefaultsAndDerived:
         assert parsed.remote_control.idle_close_minutes == 0
         env.rejects(env.minimal(remoteControl={"idleCloseMinutes": -1}), r"remoteControl\.idleCloseMinutes")
         env.rejects(env.minimal(remoteControl={"idleCloseMinutes": 1.5}), r"remoteControl\.idleCloseMinutes")
+
+    def test_validates_idle_shutdown_minutes(self, env: Env) -> None:
+        assert env.parse(env.minimal(idleShutdownMinutes=180)).idle_shutdown_minutes == 180
+        assert env.parse(env.minimal(idleShutdownMinutes=60.0)).idle_shutdown_minutes == 60
+        assert env.parse(env.minimal(idleShutdownMinutes=0)).idle_shutdown_minutes == 0
+        for bad in (-1, 1.5, True, "60"):
+            env.rejects(env.minimal(idleShutdownMinutes=bad), r"idleShutdownMinutes")
 
 
 class TestPublicUrl:

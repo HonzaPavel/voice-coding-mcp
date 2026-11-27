@@ -246,6 +246,10 @@ class _ConfigFile(_Section):
     remote_control: RemoteControlConfig = Field(default_factory=RemoteControlConfig)
     oauth: OAuthConfig = Field(default_factory=OAuthConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    idle_shutdown_minutes: Annotated[Int, Field(ge=0)] = 0
+    """Stop the server after this many minutes without an authenticated tools/call and without
+    work in progress; 0 (the default) turns the idle shutdown off. `serve --idle-shutdown-minutes`
+    overrides it."""
     log_prompts: bool = False
 
 
@@ -272,6 +276,7 @@ class Config:
     """Canonical MCP resource: `issuer + "/mcp"`."""
     public_host: str
     """Host (with port when not default) that the `Host` header must match."""
+    idle_shutdown_minutes: int = 0
 
 
 # --- checks ----------------------------------------------------------------------------------
@@ -373,6 +378,7 @@ def parse_config(data: object, *, home_dir: str | None = None) -> Config:
         issuer=issuer,
         resource_url=f"{issuer}/mcp",
         public_host=public_host,
+        idle_shutdown_minutes=parsed.idle_shutdown_minutes,
     )
 
 

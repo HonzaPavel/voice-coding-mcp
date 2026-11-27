@@ -5,7 +5,7 @@ voice-coding-mcp can run in two ways. Pick one:
 | | Part A: Mac (main) | Part B: Linux VPS (alternative) |
 |---|---|---|
 | Where it runs | Your own Mac, next to your Claude Code sessions | A dedicated VPS (the runbook uses Oracle Cloud Always Free) |
-| Reachable from the internet | Only while switched on (`vcm-mac on` to `vcm-mac off`), via Tailscale Funnel | Always, via Caddy and Let's Encrypt |
+| Reachable from the internet | Only while switched on (`vcm-mac on` to `vcm-mac off` or the automatic idle shutdown), via Tailscale Funnel | Always, via Caddy and Let's Encrypt |
 | Claude Code runs as | Your own macOS user | A dedicated user `vcm` without sudo |
 | Your own sessions | Can list, query and message them | Not reachable |
 | Isolation of your own computer | None while on | Your computer is not exposed |
@@ -35,7 +35,18 @@ deploy/mac/vcm-mac status   # on or off, connector URL, server pid, then `voice-
 deploy/mac/vcm-mac off      # close the Funnel and stop the server; safe to run twice
 ```
 
-It stays on until `vcm-mac off`, also after the terminal or the Claude Code session that started it is closed. You can run both commands from a Remote Control session on your phone. Notes:
+It stays on until `vcm-mac off` or the automatic shutdown below, also after the terminal or the Claude Code session that started it is closed. You can run both commands from a Remote Control session on your phone.
+
+Automatic shutdown: 3 hours (by default) after the last tool call, the server exits by itself and the Funnel closes, so the end state is the same as after `vcm-mac off`. Notes:
+
+- Only tool calls with a valid token count as activity. Scanners probing the public URL, and the app's `initialize` and `tools/list` requests, do not keep it on.
+- It never shuts down while a headless task runs or while an ask or relay to one of your sessions is in flight. Remote Control sessions opened with `resume_task_in_remote_control` run independently and are not stopped.
+- A task that is still running when the server stops (for example after `vcm-mac off`) ends as failed.
+- Change the delay with `idleShutdownMinutes` in the config (`vcm-mac` passes it as `serve --idle-shutdown-minutes`, 180 when the key is missing); `0` turns the automatic shutdown off. `vcm-mac status` shows the current setting.
+- After an automatic shutdown just run `vcm-mac on` again; the tokens are still valid, no pairing needed.
+- How the Funnel closes: after a successful `on`, `vcm-mac` leaves a detached watcher (`vcm-mac _watch`, pid in `<run dir>/watcher.pid`, output in the server log) that checks every 15 s whether the server still holds its pid file lock. Once the server is gone for any reason (idle shutdown, crash, `off`), the watcher waits for the on/off lock (up to 120 s, then it tries again), checks under the lock that no new server has started meanwhile, and closes the Funnel the same way `off` does. Each `on` starts a new watcher and an older one exits; `off` removes the pid file, so its watcher exits without doing anything. A Funnel left open by a reboot (the Funnel config survives restarts, the watcher does not) still needs `vcm-mac off`.
+
+Other notes:
 
 - `off` acts only if `tailscale funnel status` shows a proxy to the server's `<listen.host>:<port>`. It takes the port from the `funnel.port` file that `on` writes, else from the config; if neither can be read (for example without jq) it warns that it assumes 8787 and that a Funnel to another port has to be closed by hand (`tailscale funnel status`). It then runs `tailscale funnel --https=443 off`, which removes everything served on public port 443 (other ports stay). It never runs `tailscale funnel reset`; if the server's proxy is still listed afterwards (for example because Tailscale asks for confirmation when port 443 has several handlers), it prints a warning with the command to run by hand.
 - The server log is `vcm-mac-server.log` in `<config dir>/logs` (or `VCM_LOG_DIR`), the pid file is in `<config dir>/run` (or `VCM_RUN_DIR`). Both are created private (umask 077). The server is started with `serve --pid-file <run dir>/server.pid`, writes its own pid there and holds a `flock` on the file while it runs. `vcm-mac` treats the server as running exactly when that lock is held (checked with `/usr/bin/lockf -kns -t 0 <file> true`, which takes the lock only for an instant), so a pid file left by a crash, `kill -9` or a reboot is recognized as stale and never leads to signalling an unrelated process. `on` and `off` run under `/usr/bin/lockf -t 0 <run dir>/vcm-mac.lock`, so a second `on` or `off` started meanwhile is refused; the kernel releases that lock when the run ends, also after a crash. `status` takes no lock.

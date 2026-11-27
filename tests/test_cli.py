@@ -106,6 +106,9 @@ def test_parses_flags_before_and_after_the_command() -> None:
     args = parse_args(["serve", "--pid-file", "/run/vcm.pid", "--config", "/c.json"])
     assert (args.command, args.pid_file, args.config) == ("serve", "/run/vcm.pid", "/c.json")
     assert parse_args(["serve"]).pid_file is None
+    assert parse_args(["serve", "--idle-shutdown-minutes", "180"]).idle_shutdown_minutes == 180
+    assert parse_args(["serve", "--idle-shutdown-minutes=0"]).idle_shutdown_minutes == 0
+    assert parse_args(["serve"]).idle_shutdown_minutes is None
 
 
 @pytest.mark.parametrize(
@@ -126,6 +129,15 @@ def test_parses_flags_before_and_after_the_command() -> None:
         (["status", "--minutes", "5"], "unrecognized arguments: --minutes 5"),
         (["pair", "--pid-file", "/x.pid"], "unrecognized arguments: --pid-file /x.pid"),
         (["serve", "--pid-file"], "argument --pid-file: expected one argument"),
+        (
+            ["serve", "--idle-shutdown-minutes", "-1"],
+            "argument --idle-shutdown-minutes: must be a whole number of at least 0, got -1",
+        ),
+        (
+            ["serve", "--idle-shutdown-minutes", "1.5"],
+            "argument --idle-shutdown-minutes: must be a whole number of at least 0, got 1.5",
+        ),
+        (["pair", "--idle-shutdown-minutes", "5"], "unrecognized arguments: --idle-shutdown-minutes 5"),
     ],
 )
 def test_rejects_bad_arguments(argv: list[str], message: str) -> None:

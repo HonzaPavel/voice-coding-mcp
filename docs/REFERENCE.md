@@ -42,6 +42,7 @@ JSON file, path from `--config` or `VCM_CONFIG`, default `/etc/voice-coding-mcp/
 | `oauth.allowLoopbackRedirects` | `false` | Allow `http` redirects to `127.0.0.1`, `localhost` or `[::1]` on any port, for testing with MCP Inspector. The server logs a warning when it is on |
 | `notify.url`, `notify.headers` | `null`, `{}` | POST a short text with the task number and project name here when a background task finishes (works with ntfy) |
 | `notify.includeResult` | `false` | Include the result text in the notification |
+| `idleShutdownMinutes` | `0` | Stop the server after this many minutes without use, so a forgotten public URL does not stay reachable. Only an authenticated `tools/call` counts as use (not `initialize`, `tools/list`, unauthenticated requests or the OAuth endpoints, so scanners keep nothing alive); the time starts at server start. Never while work is in progress: a tool call being handled, a queued or running headless task, an ask, or a relay waiting for the reply (the time then counts from when it ended). Remote Control session tasks run on their own and do not count. Checked every minute; the server logs `idle shutdown` (with the idle minutes) and stops as on SIGTERM, exit code 0. An integer of at least 0; `0` (the default) turns it off. `serve --idle-shutdown-minutes` overrides it (`vcm-mac` passes 180) |
 | `logPrompts` | `false` | Log prompts and Claude's stderr. When off, prompts are not logged and Claude's stderr is logged only as its length |
 
 ## CLI
@@ -54,7 +55,7 @@ On the VPS use the wrapper, which runs as the service user and adds `--config /e
 
 | Command | What it does |
 |---|---|
-| `serve` | Run the server (started by systemd on a VPS or by `vcm-mac` on a Mac). Without `CLAUDE_CODE_OAUTH_TOKEN` it logs (info) that tasks use the logged-in user's credentials, which is expected on a Mac. Stops gracefully on SIGTERM or SIGINT: no new connections, queued and running tasks end as failed ("server stopped (SIGTERM)"), at most 20 s. `--pid-file PATH` (see below) |
+| `serve` | Run the server (started by systemd on a VPS or by `vcm-mac` on a Mac). Without `CLAUDE_CODE_OAUTH_TOKEN` it logs (info) that tasks use the logged-in user's credentials, which is expected on a Mac. Stops gracefully on SIGTERM or SIGINT: no new connections, queued and running tasks end as failed ("server stopped (SIGTERM)"), at most 20 s. `--pid-file PATH` (see below). `--idle-shutdown-minutes N` (an integer of at least 0) overrides `idleShutdownMinutes`; the idle shutdown stops it the same way, reason "idle shutdown", exit code 0 |
 | `pair [--minutes N]` | Open the pairing window and print a one-time code, its expiry in local time and the connector URL. Default `oauth.pairingMinutes` (10), at most 1440. An IP is locked out for the rest of the window after 5 wrong codes; after 50 wrong codes in total the window closes. A new `pair` replaces the old code |
 | `unpair` | Close the pairing window |
 | `status` | Show the connector URL, the pairing window, connected clients (no secrets; client names with control characters removed; last use as "just now", "5 minutes ago", "3 hours ago", "2 days ago" or "never") and task counts by status |
