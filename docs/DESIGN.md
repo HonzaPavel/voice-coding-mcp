@@ -47,6 +47,7 @@ Single owner, single process, state in JSON files under `stateDir`.
 | `src/voice_coding_mcp/notify.py` | Optional push notification when a task finishes |
 | `src/voice_coding_mcp/mcp.py` | MCP tool definitions |
 | `src/voice_coding_mcp/http.py` | Starlette app: Host/Origin checks, auth routes, `/mcp`, `/healthz` |
+| `src/voice_coding_mcp/idle_close.py`, `idle_shutdown.py` | Stop idle Remote Control sessions; stop the whole server when it has been idle |
 | `src/voice_coding_mcp/cli.py` | Entry point (`voice-coding-mcp` script, argparse): `serve` (optionally with a locked `--pid-file`), `pair`, `unpair`, `status`, `revoke-all` |
 | `tests/` | One test module per source module, `test_e2e.py` drives the real server with the SDK client; `fixtures/fake_claude.py` is the fake `claude` |
 
@@ -63,7 +64,7 @@ Modules receive their dependencies (options, logger, clock) as arguments so they
 - Outbound HTTP takes an injected `httpx2.AsyncClient` (tests use `httpx2.MockTransport`). Redirects are not followed and the CIMD body cap is enforced while streaming.
 - Child processes run with `start_new_session=True`; an exit signal comes from a negative return code. Transcripts are read as bytes and decoded per complete line.
 - Routing: case-insensitive paths, one optional trailing slash, 404 for a wrong method except `GET`/`HEAD`/`DELETE /mcp` (405). Body limits: `/mcp` 1 MB, OAuth endpoints 16 KB (JSON and forms). JSON bodies must be UTF-8 without a Content-Encoding; NaN and Infinity are rejected in bodies, the config and state files. MCP tools are registered once on one stateless server; responses are plain JSON, never SSE.
-- `serve` handles SIGTERM and SIGINT itself (uvicorn's handlers are off): the first signal stops gracefully, a second one exits at once. The `mcp` and `uvicorn` warnings are bridged into the JSON logger.
+- `serve` handles SIGTERM and SIGINT itself (uvicorn's handlers are off): the first signal stops gracefully, a second one exits at once. The idle shutdown takes the same stop path (exit code 0). The `mcp` and `uvicorn` warnings are bridged into the JSON logger.
 
 ## Config
 
@@ -100,6 +101,7 @@ JSON file, path from `--config` or `VCM_CONFIG`, default `/etc/voice-coding-mcp/
     "allowLoopbackRedirects": false
   },
   "notify": { "url": null, "headers": {}, "includeResult": false },
+  "idleShutdownMinutes": 0,
   "logPrompts": false
 }
 ```
@@ -113,6 +115,7 @@ Validation rules:
 - `projectRoots`: absolute, existing directories, resolved with `realpath`. Reject `/`, the home directory, any ancestor of the home directory, and any root that contains `stateDir`.
 - `claude.permissionMode` is one of `auto`, `acceptEdits`, `dontAsk`, `plan`, `manual`; never `bypassPermissions`. `extraArgs` must not contain `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions`, `--permission-mode`, `--permission-prompts`, `--mcp-config`, `--strict-mcp-config`, `--setting-sources`, `--settings`, `--allowedTools`/`--allowed-tools`, `--tools`, `--add-dir`, `--system-prompt`, `--append-system-prompt`, `--bare` (`--bare` ignores the OAuth token), `--name` or `-n` (the server names every run, and the relay's name is what the reply watcher looks for), also not in `--flag=value` form. This list must match `FORBIDDEN_EXTRA_ARGS` in `config.py` and the table in [REFERENCE.md](REFERENCE.md#configuration).
 - `remoteControl.idleCloseMinutes` is an integer of at least 0. A warning is logged when `remoteControl.handoffToDesktop` is on outside macOS (it is ignored there).
+- `idleShutdownMinutes` is an integer of at least 0; `serve --idle-shutdown-minutes N` (also an integer of at least 0) overrides it.
 - `claude.effort` is one of `low`, `medium`, `high`, `xhigh`, `max`.
 - `claude.access` is `isolated` (default) or `desktop` (see [Task access](#task-access)). A warning is logged when it is `desktop`.
 - `claude.settingSources` defaults to `user`: project settings may come from a cloned third-party repo and their hooks would run unattended. That holds for `.claude/settings.json` and also for `.claude/settings.local.json`, which a repo can commit as well. Adding `project` or `local` is an explicit choice.
@@ -281,6 +284,14 @@ Idle close (`remoteControl.idleCloseMinutes`, default `0` (off), an opt-in meant
 Handoff to the desktop app (`remoteControl.handoffToDesktop`, default off, macOS only; ignored with a startup warning elsewhere): the desktop app lists its own records plus only recent or live CLI sessions, so a stopped voice session drops out of its list. After `cancel_task` or the idle close stopped a Remote Control session, a background job waits (poll 0.5 s, at most 30 s) until the live registry no longer lists the session, because the app does not check whether another process owns the transcript; then it runs `/usr/bin/open claude://resume?session=<id>` (argv, no shell, the id UUID-validated). The app adopts the transcript into its own permanent list with the session's name (verified with Claude Code 2.1.331 and the desktop app on 25 Nov 2026: the adopted record had the `--name` title). If the session is still listed after the wait, nothing is opened. At server shutdown pending handoffs get up to 5 s to finish, then they are cancelled (logged). Failures are logged, never reported to the voice model. After a successful open the task file records `handedOverAt` (ISO time) and `desktopSessionId` (the session id the desktop app now owns; optional keys). Both are cleared when `resume_task_in_remote_control` launches the session again (the server's bg session, usually a copy, then holds the latest conversation), and the next stop hands that session over again.
 
 Verified live on 25 Nov 2026 (Claude Code 2.1.331, desktop app): a session started with `claude --bg --remote-control <name> --name <name>`, stopped and handed over got exactly one desktop record (`local_<uuid>.json`, `cliSessionId` the CLI session id) with the `--name` title. Resuming it through `RemoteControl.open` started a copy under a new id (it had run as a bg session before), which connected to Remote Control; after `close` the handoff gave the copy its own record with the same title. The original id still had exactly one record with its title, also after its `claude://resume` link was opened again. That copy came from the CLI's background list (see "Copies"); with `claude rm` before the resume a rerun of the same flow kept the id, and after the next stop and handoff the session still had exactly one desktop record with its title. Only when `rm` refuses does a copy still get a second record with the same title; the copy is handed over anyway, because it holds the newest conversation. Not verified live: the desktop import refusing while a CLI process owns the transcript, and how the registry entry looks while the owner continues the session in the desktop app (taken from an earlier observation: `kind: "interactive"`, the same `sessionId`, `bridgeSessionId` with Remote Control on). Headless tasks are never handed over, only Remote Control sessions; stopping a stale session before reopening it does not hand it over either.
+
+## Idle shutdown
+
+`idleShutdownMinutes` (default `0`, off; `serve --idle-shutdown-minutes` overrides it, `vcm-mac` passes 180; `idle_shutdown.py`) stops the server after a period without use, so a forgotten `vcm-mac on` does not leave the Mac reachable from the internet. `vcm-mac` closes the Funnel once the server process has exited.
+
+- Activity is only an MCP `tools/call` that passed the bearer check: `_McpEndpoint` sits behind `BearerMiddleware` and marks a request whose JSON-RPC body (or batch) has `method: "tools/call"`, at its start and at its end. `initialize`, `tools/list`, unauthenticated or invalid-token requests, the OAuth endpoints and anything else (scanners probe the public URL) never count. The idle time starts at server start.
+- Never while work is in progress: a tools/call still being handled, or `TaskManager.has_work()` (a queued or active headless task; ask and relay runs are tasks, and a relay waiting for the session's reply stays active although it has given up its run slot). A check that sees such work moves the last activity to now, so the idle time counts from when the work ended. Remote Control session tasks (`remoteControl: true`) have no run slot, run on without the server and do not keep it up.
+- A check every minute. When the idle time is reached it logs `idle shutdown` with `idleMinutes` (info), once, and calls `RunningServer.stop_soon("idle shutdown")`: the same graceful stop as SIGTERM (stop accepting, `TaskManager.shutdown`, at most 20 s), and `serve` exits with code 0. The state is in memory only.
 
 ## HTTP hardening
 

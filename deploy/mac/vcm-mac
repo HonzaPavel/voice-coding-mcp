@@ -3,7 +3,8 @@
 # shellcheck disable=SC2016
 # vcm-mac: run voice-coding-mcp on a Mac on demand, published through Tailscale Funnel.
 #
-#   vcm-mac on       start the server and open the Funnel; it stays on until `vcm-mac off`
+#   vcm-mac on       start the server and open the Funnel; it stays on until `vcm-mac off` or until
+#                    the server shuts down after idleShutdownMinutes (default 180) without tool calls
 #   vcm-mac off      close the Funnel and stop the server (idempotent)
 #   vcm-mac status   show whether it is on, the URL, the server pid and `voice-coding-mcp status`
 #
@@ -12,6 +13,7 @@
 #   VCM_LOG_DIR    directory for the server log (default <config dir>/logs)
 #   VCM_RUN_DIR    directory for pid and state files (default <config dir>/run)
 #   VCM_TAILSCALE  path to the Tailscale CLI (default: the Mac app's binary, then `tailscale` on PATH)
+#   VCM_WATCH_INTERVAL  seconds between the watcher's checks that the server still runs (default 15)
 #
 # Written for the bash 3.2 that ships with macOS.
 
@@ -34,6 +36,11 @@ LOG_FILE="$LOG_DIR/vcm-mac-server.log"
 SERVER_PID_FILE="$RUN_DIR/server.pid"
 FUNNEL_PORT_FILE="$RUN_DIR/funnel.port"
 LOCK_FILE="$RUN_DIR/vcm-mac.lock"
+WATCHER_PID_FILE="$RUN_DIR/watcher.pid"
+# How often the watcher checks whether the server still runs, and how long it waits for the
+# on/off lock before it tries again.
+WATCH_INTERVAL="${VCM_WATCH_INTERVAL:-15}"
+WATCH_LOCK_WAIT=120
 # Set from listen.host in the config by load_listen.
 LISTEN_HOST="127.0.0.1"
 
@@ -50,7 +57,7 @@ info() {
 }
 
 usage() {
-  sed -n '2,12p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+  sed -n '4,16p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
 }
 
 # Runs the Python CLI from the repo's uv project (uv syncs the venv from uv.lock on first use).
@@ -116,6 +123,17 @@ require_config() {
 
 config_port() {
   jq -r '.listen.port // 8787' "$CONFIG"
+}
+
+# Minutes without tool calls after which the server exits by itself (0 = never). The script's
+# default is 180 even when the server's own default is 0.
+config_idle_minutes() {
+  local m
+  m="$(jq -r '.idleShutdownMinutes // 180' "$CONFIG")"
+  case "$m" in
+    "" | *[!0-9]*) die "idleShutdownMinutes in $CONFIG must be a whole number of minutes (0 turns it off), not $m." ;;
+  esac
+  printf '%s\n' "$m"
 }
 
 config_host() {
@@ -310,7 +328,8 @@ run_locked() {
 }
 
 start_server() {
-  local port="$1" launch pid i
+  local port="$1" launch pid i idle
+  idle="$(config_idle_minutes)"
   make_dirs
   if healthy "$port"; then
     die "Something already answers on $(url_host):$port and it is not a server started by vcm-mac. Stop it first."
@@ -319,7 +338,7 @@ start_server() {
     printf '\n--- vcm-mac on, %s ---\n' "$(date '+%Y-%m-%d %H:%M:%S')"
   } >>"$LOG_FILE"
   nohup caffeinate -is "$UV" run --frozen --quiet --project "$REPO_DIR" voice-coding-mcp serve --config "$CONFIG" \
-    --pid-file "$SERVER_PID_FILE" </dev/null >>"$LOG_FILE" 2>&1 &
+    --pid-file "$SERVER_PID_FILE" --idle-shutdown-minutes "$idle" </dev/null >>"$LOG_FILE" 2>&1 &
   launch=$!
   i=0
   while [ "$i" -lt 60 ]; do
@@ -455,10 +474,78 @@ close_funnel() {
   fi
 }
 
+# --- watcher ---------------------------------------------------------------
+
+# The watcher is a detached `vcm-mac _watch` that `on` leaves behind. Once the server is gone (idle
+# shutdown, crash or `off`), it closes the Funnel, so the end state is the same as after `off`.
+# Only the watcher whose pid is in $WATCHER_PID_FILE acts; an older one exits when it sees another
+# pid there (each `on` starts a new one), and `off` removes the file.
+
+watch_log() {
+  printf '%s vcm-mac watcher %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "${WATCH_ID:-$$}" "$*"
+}
+
+# Succeeds if watcher $1 is still the current one.
+current_watcher() {
+  [ "$(read_pid "$WATCHER_PID_FILE" 2>/dev/null || true)" = "$1" ]
+}
+
+# Starts the watcher detached from the terminal, with its output in the server log.
+start_watcher() {
+  local pid
+  make_dirs
+  nohup "$SCRIPT_PATH" _watch </dev/null >>"$LOG_FILE" 2>&1 &
+  pid=$!
+  echo "$pid" >"$WATCHER_PID_FILE"
+}
+
+cmd_watch() {
+  local me="$$" rc
+  # `on` writes the pid file right after the start; give it a moment.
+  sleep 1
+  current_watcher "$me" || exit 0
+  watch_log "started, checking every ${WATCH_INTERVAL} s whether the server still runs."
+  while :; do
+    current_watcher "$me" || exit 0
+    if pid_file_locked; then
+      sleep "$WATCH_INTERVAL"
+      continue
+    fi
+    # The server is gone. Close the Funnel under the on/off lock (waiting for a running on or
+    # off instead of racing it); the locked run checks again that no new server has started.
+    rc=0
+    VCM_LOCKED=1 /usr/bin/lockf -ks -t "$WATCH_LOCK_WAIT" "$LOCK_FILE" "$SCRIPT_PATH" _watch-close "$me" || rc=$?
+    if [ "$rc" -eq 75 ]; then
+      watch_log "the on/off lock stayed busy for ${WATCH_LOCK_WAIT} s, trying again."
+      continue
+    fi
+    [ "$rc" -eq 0 ] || watch_log "closing the Funnel failed (exit code $rc)."
+    exit 0
+  done
+}
+
+# Runs under the on/off lock, called by watcher $1.
+cmd_watch_close() {
+  local me="$1"
+  WATCH_ID="$me"
+  current_watcher "$me" || exit 0
+  if pid_file_locked; then
+    # A new `on` started a server meanwhile (and normally a new watcher).
+    watch_log "a server runs again, nothing to close."
+    exit 0
+  fi
+  rm -f "$WATCHER_PID_FILE"
+  watch_log "the server is no longer running, closing the Funnel."
+  if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then load_listen; fi
+  close_funnel
+  drop_stale_pid_file
+  watch_log "off."
+}
+
 # --- commands --------------------------------------------------------------
 
 cmd_on() {
-  local host url port result
+  local host url port result idle
   require_tools
   require_config
   require_tailscale
@@ -489,14 +576,22 @@ cmd_on() {
     stop_server
     exit 1
   fi
+  start_watcher
 
   info ""
   info "On. Connector URL: $url/mcp"
-  info "It stays on until you run: $SCRIPT_PATH off"
+  idle="$(config_idle_minutes)"
+  if [ "$idle" -gt 0 ]; then
+    info "It stays on until you run $SCRIPT_PATH off, or until $idle minutes pass without a tool call."
+  else
+    info "It stays on until you run: $SCRIPT_PATH off"
+  fi
   info "To pair a new client: uv run --project $REPO_DIR voice-coding-mcp pair --config $CONFIG"
 }
 
 cmd_off() {
+  # The watcher exits once it sees its pid file gone.
+  rm -f "$WATCHER_PID_FILE"
   if [ -f "$CONFIG" ] && command -v jq >/dev/null 2>&1; then load_listen; fi
   close_funnel
   stop_server
@@ -504,7 +599,7 @@ cmd_off() {
 }
 
 cmd_status() {
-  local pid port url state="off"
+  local pid port url idle state="off"
   require_jq
   require_config
   port="$(config_port)"
@@ -520,6 +615,12 @@ cmd_status() {
   info "State: $state"
   info "Connector URL: ${url%/}/mcp"
   info "Server pid: ${pid:-none} (port $port)"
+  idle="$(config_idle_minutes)"
+  if [ "$idle" -gt 0 ]; then
+    info "Idle shutdown: after $idle minutes without a tool call (server and Funnel)"
+  else
+    info "Idle shutdown: off"
+  fi
   [ -n "$TS" ] || info "Tailscale CLI: not found"
   info ""
   if [ -n "$UV" ] || UV="$(command -v uv 2>/dev/null)"; then
@@ -541,6 +642,14 @@ case "${1:-}" in
     ;;
   status)
     cmd_status
+    ;;
+  _watch)
+    cmd_watch
+    ;;
+  _watch-close)
+    if [ "${VCM_LOCKED:-}" != 1 ] || [ "$#" -ne 2 ]; then die "_watch-close is internal to the watcher."; fi
+    unset VCM_LOCKED
+    cmd_watch_close "$2"
     ;;
   -h | --help | help)
     usage

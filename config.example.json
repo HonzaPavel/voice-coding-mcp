@@ -27,5 +27,6 @@
     "allowLoopbackRedirects": false
   },
   "notify": { "url": null, "headers": {}, "includeResult": false },
+  "idleShutdownMinutes": 0,
   "logPrompts": false
 }
